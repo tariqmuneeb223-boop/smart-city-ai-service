@@ -1,0 +1,51 @@
+# ==================== ENVIRONMENT ====================
+.env
+.env.local
+.env.production
+.env.*.local
+
+# ==================== PYTHON ====================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+
+# ==================== IDE ====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+
+# ==================== OS ====================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==================== LOGS & TEST OUTPUT ====================
+*.log
+model_test_output.txt
+test_output.txt
+*.tmp
+
+# ==================== TEST FILES ====================
+test.py
+test_*.py
+
+# ==================== LARGE DATA (NOT NEEDED AT RUNTIME) ====================
+dataset/
+datasets/
+data/
+uploads/
+logs/
+runs/
+outputs/
+checkpoints/
+*.ckpt
+*.pth
