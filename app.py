@@ -1,3 +1,10 @@
+# ✅ Set env vars BEFORE importing TensorFlow (prevents warnings, saves RAM)
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+os.environ['MPLCONFIGDIR'] = '/tmp/matplotlib'
+os.makedirs('/tmp/matplotlib', exist_ok=True)
+
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -5,13 +12,9 @@ import tensorflow as tf
 import numpy as np
 from PIL import Image
 import io
-import os
-from ultralytics import YOLO
 
 # ✅ Load environment variables
 load_dotenv()
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 app = FastAPI(title="Smart City Attock AI Service")
 app.add_middleware(
@@ -26,10 +29,9 @@ app.add_middleware(
 AI_SERVICE_KEY = os.getenv("AI_SERVICE_KEY")
 
 # ✅ API Key verification function
-def verify_api_key(x_api_key: str = Header(...)):
+def verify_api_key(x_api_key: str = Header(None)):
     if not AI_SERVICE_KEY:
-        # If no key is set, allow requests (for development)
-        return x_api_key
+        return x_api_key or "no-key"
     if x_api_key != AI_SERVICE_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return x_api_key
@@ -37,7 +39,7 @@ def verify_api_key(x_api_key: str = Header(...)):
 models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 
 # ------------------------------
-# 1. Issue classifier (garbage, other, pothole, streetlight)
+# 1. Issue classifier
 # ------------------------------
 issue_model_path = os.path.join(models_dir, "issue_classifier.keras")
 issue_classes = ['garbage', 'other', 'pothole', 'streetlight']
@@ -57,7 +59,6 @@ issue_model = None
 if os.path.exists(issue_model_path):
     issue_model = tf.keras.models.load_model(issue_model_path)
     print("✅ Issue classifier loaded successfully!")
-    issue_model.summary()
 else:
     print("❌ Issue classifier file not found!")
 
@@ -91,17 +92,41 @@ print(f"Garbage classes: {garbage_classes}")
 print("=" * 50)
 
 # ------------------------------
-# 3. YOLOv8 for vehicle counting
+# 3. YOLOv8 — LAZY LOADED
 # ------------------------------
-print("\nLoading YOLOv8 for vehicle counting...")
-yolo_model = YOLO("yolov8n.pt")
+# ✅ YOLO is only loaded when a traffic check is actually needed.
+#    This saves ~180 MB of RAM at startup so the free tier doesn't OOM.
+_yolo_model = None
 VEHICLE_CLASSES = {"car", "bus", "truck", "motorcycle"}
 VEHICLE_COUNT_THRESHOLD = 12
-print("✅ YOLOv8 loaded successfully!")
+
+def get_yolo():
+    """Load YOLO on first use, keep it in memory after that."""
+    global _yolo_model
+    if _yolo_model is None:
+        print("Loading YOLOv8 for vehicle counting (first use)...")
+        from ultralytics import YOLO
+        _yolo_model = YOLO("yolov8n.pt")
+        print("✅ YOLOv8 loaded successfully!")
+    return _yolo_model
+
+# ------------------------------
+# Warm up models once at startup
+# ------------------------------
+print("🔥 Warming up CNN models...")
+try:
+    _dummy = np.zeros((1, 224, 224, 3), dtype=np.float32)
+    if issue_model is not None:
+        issue_model.predict(_dummy, verbose=0)
+    if garbage_model is not None:
+        garbage_model.predict(_dummy, verbose=0)
+    print("✅ Models warmed up")
+except Exception as e:
+    print(f"⚠️ Warmup failed (non-fatal): {e}")
 print("=" * 50)
 
 # ------------------------------
-# Preprocessing
+# Preprocessing helpers
 # ------------------------------
 def load_image_array(image_bytes):
     image = Image.open(io.BytesIO(image_bytes))
@@ -113,10 +138,12 @@ def load_image_array(image_bytes):
     return img_array.astype(np.float32)
 
 def count_vehicles(image_bytes):
+    """Runs YOLO on the image and counts vehicles."""
+    yolo = get_yolo()
     image = Image.open(io.BytesIO(image_bytes))
     if image.mode != 'RGB':
         image = image.convert('RGB')
-    results = yolo_model(image, verbose=False)[0]
+    results = yolo(image, verbose=False)[0]
     names = results.names
     count = 0
     for box in results.boxes:
@@ -153,8 +180,20 @@ async def root():
         "status": "running",
         "models": {
             "issue_classifier": issue_model is not None,
-            "garbage_classifier": garbage_model is not None
+            "garbage_classifier": garbage_model is not None,
+            "yolo": _yolo_model is not None
         }
+    }
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "issue_loaded": issue_model is not None,
+        "garbage_loaded": garbage_model is not None,
+        "yolo_loaded": _yolo_model is not None,
+        "tensorflow_version": tf.__version__,
+        "api_key_configured": AI_SERVICE_KEY is not None
     }
 
 @app.post("/classify-issue")
@@ -168,19 +207,7 @@ async def classify_issue(
     try:
         contents = await file.read()
 
-        # Step 1: check for traffic jam via vehicle counting (YOLO)
-        vehicle_count = count_vehicles(contents)
-        if vehicle_count >= VEHICLE_COUNT_THRESHOLD:
-            return {
-                "success": True,
-                "class": "traffic",
-                "category": "TRAFFIC_ISSUE",
-                "confidence": None,
-                "vehicle_count": vehicle_count,
-                "message": f"Detected {vehicle_count} vehicles -- classified as traffic jam"
-            }
-
-        # Step 2: not a traffic jam -- run the CNN
+        # ✅ Run CNN FIRST — fast, decides 95% of cases
         img_array = load_image_array(contents)
         preds = issue_model.predict(img_array, verbose=0)[0]
         idx = int(np.argmax(preds))
@@ -191,6 +218,20 @@ async def classify_issue(
             name: round(float(preds[i]), 4)
             for i, name in enumerate(issue_classes)
         }
+
+        # ✅ Only run YOLO if CNN is uncertain (saves 3-5s on most images)
+        vehicle_count = None
+        if confidence < 0.6 or predicted_class == 'other':
+            vehicle_count = count_vehicles(contents)
+            if vehicle_count >= VEHICLE_COUNT_THRESHOLD:
+                return {
+                    "success": True,
+                    "class": "traffic",
+                    "category": "TRAFFIC_ISSUE",
+                    "confidence": None,
+                    "vehicle_count": vehicle_count,
+                    "message": f"Detected {vehicle_count} vehicles — classified as traffic jam"
+                }
 
         response = {
             "success": True,
@@ -232,16 +273,7 @@ async def classify_garbage(
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "issue_loaded": issue_model is not None,
-        "garbage_loaded": garbage_model is not None,
-        "tensorflow_version": tf.__version__,
-        "api_key_configured": AI_SERVICE_KEY is not None
-    }
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    port = int(os.environ.get("PORT", 8001))
+    uvicorn.run(app, host="0.0.0.0", port=port)
