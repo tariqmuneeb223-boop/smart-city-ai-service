@@ -3,15 +3,21 @@ import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 os.environ['MPLCONFIGDIR'] = '/tmp/matplotlib'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.makedirs('/tmp/matplotlib', exist_ok=True)
 
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from dotenv import load_dotenv
 import tensorflow as tf
 import numpy as np
 from PIL import Image
 import io
+import cv2
+import onnxruntime as ort
 
 # ✅ Load environment variables
 load_dotenv()
@@ -92,26 +98,23 @@ print(f"Garbage classes: {garbage_classes}")
 print("=" * 50)
 
 # ------------------------------
-# 3. YOLOv8 — LAZY LOADED
+# 3. YOLOv8 ONNX for vehicle counting
 # ------------------------------
-# ✅ YOLO is only loaded when a traffic check is actually needed.
-#    This saves ~180 MB of RAM at startup so the free tier doesn't OOM.
-_yolo_model = None
-VEHICLE_CLASSES = {"car", "bus", "truck", "motorcycle"}
+print("\nLoading YOLOv8 ONNX model for vehicle counting...")
+yolo_session = None
+try:
+    onnx_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolov8n.onnx")
+    yolo_session = ort.InferenceSession(onnx_path)
+    print("✅ YOLOv8 ONNX loaded successfully!")
+except Exception as e:
+    print(f"❌ Failed to load YOLOv8 ONNX: {e}")
+
+# COCO class IDs for vehicles: 2=car, 3=motorcycle, 5=bus, 7=truck
+VEHICLE_CLASSES = {2, 3, 5, 7}
 VEHICLE_COUNT_THRESHOLD = 12
 
-def get_yolo():
-    """Load YOLO on first use, keep it in memory after that."""
-    global _yolo_model
-    if _yolo_model is None:
-        print("Loading YOLOv8 for vehicle counting (first use)...")
-        from ultralytics import YOLO
-        _yolo_model = YOLO("yolov8n.pt")
-        print("✅ YOLOv8 loaded successfully!")
-    return _yolo_model
-
 # ------------------------------
-# Warm up models once at startup
+# Warm up CNN models once at startup
 # ------------------------------
 print("🔥 Warming up CNN models...")
 try:
@@ -120,7 +123,7 @@ try:
         issue_model.predict(_dummy, verbose=0)
     if garbage_model is not None:
         garbage_model.predict(_dummy, verbose=0)
-    print("✅ Models warmed up")
+    print("✅ CNN models warmed up")
 except Exception as e:
     print(f"⚠️ Warmup failed (non-fatal): {e}")
 print("=" * 50)
@@ -137,21 +140,52 @@ def load_image_array(image_bytes):
     img_array = np.expand_dims(img_array, axis=0)
     return img_array.astype(np.float32)
 
+
+def preprocess_yolo(image_bytes):
+    """Preprocess image for YOLOv8 ONNX model (letterbox + normalize)."""
+    img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    img = np.array(img)
+
+    shape = img.shape[:2]
+    new_shape = (640, 640)
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    dw, dh = (new_shape[1] - new_unpad[0]) / 2, (new_shape[0] - new_unpad[1]) / 2
+
+    if shape[::-1] != new_unpad:
+        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    img = cv2.copyMakeBorder(
+        img, top, bottom, left, right,
+        cv2.BORDER_CONSTANT, value=(114, 114, 114)
+    )
+
+    img = np.ascontiguousarray(img.transpose(2, 0, 1), dtype=np.float32) / 255.0
+    return img[None]
+
+
 def count_vehicles(image_bytes):
-    """Runs YOLO on the image and counts vehicles."""
-    yolo = get_yolo()
-    image = Image.open(io.BytesIO(image_bytes))
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
-    results = yolo(image, verbose=False)[0]
-    names = results.names
+    """Runs YOLO ONNX on the image and counts vehicles."""
+    if yolo_session is None:
+        return 0
+
+    input_tensor = preprocess_yolo(image_bytes)
+    input_name = yolo_session.get_inputs()[0].name
+    outputs = yolo_session.run(None, {input_name: input_tensor})[0]
+
+    # Output shape: (1, 84, 8400) — 4 bbox + 80 class scores
+    predictions = outputs[0].T  # (8400, 84)
     count = 0
-    for box in results.boxes:
-        cls_id = int(box.cls[0])
-        label = names[cls_id]
-        if label in VEHICLE_CLASSES:
+    for pred in predictions:
+        class_scores = pred[4:]
+        class_id = int(np.argmax(class_scores))
+        confidence = float(class_scores[class_id])
+        if confidence > 0.5 and class_id in VEHICLE_CLASSES:
             count += 1
     return count
+
 
 def classify_garbage_type(img_array):
     if garbage_model is None:
@@ -181,7 +215,7 @@ async def root():
         "models": {
             "issue_classifier": issue_model is not None,
             "garbage_classifier": garbage_model is not None,
-            "yolo": _yolo_model is not None
+            "yolo_onnx": yolo_session is not None
         }
     }
 
@@ -191,10 +225,15 @@ async def health_check():
         "status": "healthy",
         "issue_loaded": issue_model is not None,
         "garbage_loaded": garbage_model is not None,
-        "yolo_loaded": _yolo_model is not None,
+        "yolo_loaded": yolo_session is not None,
         "tensorflow_version": tf.__version__,
         "api_key_configured": AI_SERVICE_KEY is not None
     }
+
+@app.head("/health")
+async def health_head():
+    """Supports UptimeRobot's HEAD request so it shows 'Up' instead of 405."""
+    return Response(status_code=200)
 
 @app.post("/classify-issue")
 async def classify_issue(
@@ -219,7 +258,7 @@ async def classify_issue(
             for i, name in enumerate(issue_classes)
         }
 
-        # ✅ Only run YOLO if CNN is uncertain (saves 3-5s on most images)
+        # ✅ Only run YOLO when CNN is uncertain (saves 3-5s on most images)
         vehicle_count = None
         if confidence < 0.6 or predicted_class == 'other':
             vehicle_count = count_vehicles(contents)
