@@ -111,7 +111,14 @@ except Exception as e:
 
 # COCO class IDs for vehicles: 2=car, 3=motorcycle, 5=bus, 7=truck
 VEHICLE_CLASSES = {2, 3, 5, 7}
-VEHICLE_COUNT_THRESHOLD = 12
+VEHICLE_COUNT_THRESHOLD = 12   # re-tune after the NMS fix: counts will now be LOWER than before
+VEHICLE_CONF_THRESHOLD = 0.25  # standard YOLO default; 0.5 missed small/far vehicles
+NMS_IOU_THRESHOLD = 0.45       # overlapping boxes above this IoU count as the same vehicle
+
+# The CNN has no 'traffic' class, so a traffic scene can be called almost anything.
+# YOLO is skipped ONLY when the CNN is confident the image is one of these classes.
+YOLO_SKIP_CLASSES = {'garbage', 'pothole'}
+YOLO_SKIP_MIN_CONFIDENCE = 0.6
 
 # ------------------------------
 # Warm up CNN models once at startup
@@ -167,7 +174,12 @@ def preprocess_yolo(image_bytes):
 
 
 def count_vehicles(image_bytes):
-    """Runs YOLO ONNX on the image and counts vehicles."""
+    """Runs YOLO ONNX on the image and counts distinct vehicles.
+
+    The ONNX export has no NMS built in, so the raw output has many overlapping
+    boxes per vehicle. We filter to confident vehicle boxes, then run NMS so each
+    physical vehicle is counted once.
+    """
     if yolo_session is None:
         return 0
 
@@ -175,16 +187,33 @@ def count_vehicles(image_bytes):
     input_name = yolo_session.get_inputs()[0].name
     outputs = yolo_session.run(None, {input_name: input_tensor})[0]
 
-    # Output shape: (1, 84, 8400) — 4 bbox + 80 class scores
+    # Output shape: (1, 84, 8400) — 4 bbox (cx, cy, w, h) + 80 class scores
     predictions = outputs[0].T  # (8400, 84)
-    count = 0
-    for pred in predictions:
-        class_scores = pred[4:]
-        class_id = int(np.argmax(class_scores))
-        confidence = float(class_scores[class_id])
-        if confidence > 0.5 and class_id in VEHICLE_CLASSES:
-            count += 1
-    return count
+
+    boxes = predictions[:, :4]
+    class_scores = predictions[:, 4:]
+    class_ids = np.argmax(class_scores, axis=1)
+    confidences = class_scores[np.arange(len(class_ids)), class_ids]
+
+    # Keep only confident vehicle detections (vectorized, no Python loop over 8400 rows)
+    mask = np.isin(class_ids, list(VEHICLE_CLASSES)) & (confidences > VEHICLE_CONF_THRESHOLD)
+    if not mask.any():
+        return 0
+
+    boxes = boxes[mask]
+    confidences = confidences[mask]
+
+    # cx, cy, w, h  ->  x, y, w, h (top-left corner) as cv2 NMS expects
+    xywh = np.stack(
+        [boxes[:, 0] - boxes[:, 2] / 2, boxes[:, 1] - boxes[:, 3] / 2, boxes[:, 2], boxes[:, 3]],
+        axis=1
+    )
+
+    keep = cv2.dnn.NMSBoxes(
+        xywh.tolist(), confidences.tolist(),
+        VEHICLE_CONF_THRESHOLD, NMS_IOU_THRESHOLD
+    )
+    return len(keep)
 
 
 def classify_garbage_type(img_array):
@@ -246,7 +275,7 @@ async def classify_issue(
     try:
         contents = await file.read()
 
-        # ✅ Run CNN FIRST — fast, decides 95% of cases
+        # ✅ Run CNN first
         img_array = load_image_array(contents)
         preds = issue_model.predict(img_array, verbose=0)[0]
         idx = int(np.argmax(preds))
@@ -258,9 +287,15 @@ async def classify_issue(
             for i, name in enumerate(issue_classes)
         }
 
-        # ✅ Only run YOLO when CNN is uncertain (saves 3-5s on most images)
+        # ✅ Run YOLO unless the CNN is confident it's garbage/pothole.
+        # Previously YOLO only ran when the CNN was unsure or said 'other', so a
+        # traffic scene confidently called 'streetlight' never reached the vehicle check.
         vehicle_count = None
-        if confidence < 0.6 or predicted_class == 'other':
+        confident_skip = (
+            predicted_class in YOLO_SKIP_CLASSES
+            and confidence >= YOLO_SKIP_MIN_CONFIDENCE
+        )
+        if not confident_skip:
             vehicle_count = count_vehicles(contents)
             if vehicle_count >= VEHICLE_COUNT_THRESHOLD:
                 return {
