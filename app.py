@@ -111,7 +111,7 @@ except Exception as e:
 
 # COCO class IDs for vehicles: 2=car, 3=motorcycle, 5=bus, 7=truck
 VEHICLE_CLASSES = {2, 3, 5, 7}
-VEHICLE_COUNT_THRESHOLD = 12   # re-tune after the NMS fix: counts will now be LOWER than before
+VEHICLE_COUNT_THRESHOLD = 8    # tuned down after NMS (counts are accurate, not inflated)
 VEHICLE_CONF_THRESHOLD = 0.25  # standard YOLO default; 0.5 missed small/far vehicles
 NMS_IOU_THRESHOLD = 0.45       # overlapping boxes above this IoU count as the same vehicle
 
@@ -153,12 +153,6 @@ def preprocess_yolo(image_bytes):
     img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
     img = np.array(img)
 
-    # ✅ Brighten dark (night) images so YOLO can detect vehicles
-    mean_brightness = img.mean()
-    if mean_brightness < 80:
-        # Boost brightness (alpha=1.8) and contrast (beta=40)
-        img = cv2.convertScaleAbs(img, alpha=1.8, beta=40)
-
     shape = img.shape[:2]
     new_shape = (640, 640)
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
@@ -177,6 +171,7 @@ def preprocess_yolo(image_bytes):
 
     img = np.ascontiguousarray(img.transpose(2, 0, 1), dtype=np.float32) / 255.0
     return img[None]
+
 
 def count_vehicles(image_bytes):
     """Runs YOLO ONNX on the image and counts distinct vehicles.
@@ -293,8 +288,6 @@ async def classify_issue(
         }
 
         # ✅ Run YOLO unless the CNN is confident it's garbage/pothole.
-        # Previously YOLO only ran when the CNN was unsure or said 'other', so a
-        # traffic scene confidently called 'streetlight' never reached the vehicle check.
         vehicle_count = None
         confident_skip = (
             predicted_class in YOLO_SKIP_CLASSES
