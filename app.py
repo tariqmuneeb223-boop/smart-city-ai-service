@@ -153,6 +153,12 @@ def preprocess_yolo(image_bytes):
     img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
     img = np.array(img)
 
+    # ✅ Brighten dark (night) images so YOLO can detect vehicles
+    mean_brightness = img.mean()
+    if mean_brightness < 80:
+        # Boost brightness (alpha=1.8) and contrast (beta=40)
+        img = cv2.convertScaleAbs(img, alpha=1.8, beta=40)
+
     shape = img.shape[:2]
     new_shape = (640, 640)
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
@@ -171,7 +177,6 @@ def preprocess_yolo(image_bytes):
 
     img = np.ascontiguousarray(img.transpose(2, 0, 1), dtype=np.float32) / 255.0
     return img[None]
-
 
 def count_vehicles(image_bytes):
     """Runs YOLO ONNX on the image and counts distinct vehicles.
